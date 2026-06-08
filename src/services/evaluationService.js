@@ -1,5 +1,6 @@
 const { queryAll, queryOne, queryRun, generateId } = require('../database/helpers');
 const { notifySupplier, notifySupervisor, notifyPurchaser } = require('./notificationService');
+const { addAuditLog } = require('./objectionService');
 
 function getEvaluationRule(db, category, method) {
     let rule = queryOne(db,
@@ -18,12 +19,7 @@ function getEvaluationRule(db, category, method) {
         );
     }
     if (!rule) {
-        rule = {
-            technical_weight: 60,
-            business_weight: 20,
-            price_weight: 20,
-            pass_score: 60
-        };
+        rule = { technical_weight: 60, business_weight: 20, price_weight: 20, pass_score: 60 };
     }
     return rule;
 }
@@ -45,9 +41,7 @@ function calculatePriceScore(allPrices, supplierPrice, method) {
         benchmarkPrice = Math.min(...validPrices);
     }
 
-    if (supplierPrice <= benchmarkPrice) {
-        return 100;
-    }
+    if (supplierPrice <= benchmarkPrice) return 100;
     const deviation = (supplierPrice - benchmarkPrice) / benchmarkPrice;
     return Math.max(0, Math.round((100 - deviation * 100) * 100) / 100);
 }
@@ -55,16 +49,37 @@ function calculatePriceScore(allPrices, supplierPrice, method) {
 function checkPriceAlert(bidPrice, allPrices, budget) {
     const alerts = [];
     const validPrices = allPrices.filter(p => p > 0);
-    if (validPrices.length <= 1 || bidPrice <= 0) return alerts;
+    if (bidPrice <= 0) return alerts;
 
     if (budget && bidPrice > budget) {
-        alerts.push({ type: 'over_budget', message: `报价￥${bidPrice}超过项目预算￥${budget}`, severity: 'high' });
+        alerts.push({
+            type: 'over_budget',
+            message: `报价￥${bidPrice}超过项目预算￥${budget}`,
+            severity: 'high',
+            budget: budget,
+            excess_amount: bidPrice - budget,
+            still_candidate: false
+        });
     }
 
-    const avgPrice = validPrices.reduce((a, b) => a + b, 0) / validPrices.length;
-    const minPrice = Math.min(...validPrices.filter(p => p !== bidPrice));
-    if (bidPrice < minPrice * 0.6) {
-        alerts.push({ type: 'abnormally_low', message: `报价￥${bidPrice}明显低于其他有效报价均价￥${avgPrice.toFixed(2)}，可能存在低价倾销风险`, severity: 'medium' });
+    if (validPrices.length > 1) {
+        const otherPrices = validPrices.filter(p => p !== bidPrice);
+        const allSame = otherPrices.every(p => p === bidPrice);
+        if (!allSame && otherPrices.length > 0) {
+            const minOther = Math.min(...otherPrices);
+            const avgOther = otherPrices.reduce((a, b) => a + b, 0) / otherPrices.length;
+            if (bidPrice < minOther * 0.6) {
+                const ratio = (1 - bidPrice / avgOther) * 100;
+                alerts.push({
+                    type: 'abnormally_low',
+                    message: `报价￥${bidPrice}明显低于其他有效报价均价￥${avgOther.toFixed(2)}，可能存在低价倾销风险`,
+                    severity: 'medium',
+                    reference_price: avgOther,
+                    below_ratio: Math.round(ratio * 100) / 100,
+                    still_candidate: true
+                });
+            }
+        }
     }
 
     return alerts;
@@ -93,17 +108,21 @@ function evaluateBids(db, announcementId) {
                 [announcementId]
             );
             notifyPurchaser(db, announcement.request_id, '流标通知',
-                `项目"${announcement.title}"无有效投标，流标处理`,
-                'warning');
+                `项目"${announcement.title}"无有效投标，流标处理`, 'warning');
             notifySupervisor(db, '项目流标',
-                `项目"${announcement.title}"无有效投标，流标处理`,
-                'warning', announcementId, 'bidding_announcement');
+                `项目"${announcement.title}"无有效投标，流标处理`, 'warning', announcementId, 'bidding_announcement');
+            addAuditLog(db, {
+                announcementId, actionType: 'failed_bid', operatorId: '', operatorName: 'system',
+                beforeStatus: announcement.status, afterStatus: 'failed_bid',
+                detail: '无有效投标，流标处理'
+            });
         }
         return { success: false, message: '无有效投标，流标处理' };
     }
 
     const rule = getEvaluationRule(db, announcement.category, announcement.procurement_method);
     const budget = announcement.budget || 0;
+    const beforeStatus = announcement.status;
 
     const isReEvaluation = queryOne(db,
         'SELECT COUNT(*) as cnt FROM evaluations WHERE announcement_id = ?',
@@ -111,15 +130,17 @@ function evaluateBids(db, announcementId) {
     ).cnt > 0;
 
     const existingEvals = isReEvaluation ? queryAll(db,
-        'SELECT supplier_id, ranking, total_score, qualification_review_id, qualification_review_status FROM evaluations WHERE announcement_id = ?',
+        'SELECT supplier_id, ranking, total_score, qualification_review_id, qualification_review_status, is_candidate FROM evaluations WHERE announcement_id = ?',
         [announcementId]
     ) : [];
     const prevRankingMap = {};
     const prevScoreMap = {};
     const existingReviewMap = {};
+    const existingCandidateMap = {};
     existingEvals.forEach(e => {
         prevRankingMap[e.supplier_id] = e.ranking;
         prevScoreMap[e.supplier_id] = e.total_score;
+        existingCandidateMap[e.supplier_id] = e.is_candidate;
         if (e.qualification_review_id) {
             existingReviewMap[e.supplier_id] = {
                 review_id: e.qualification_review_id,
@@ -139,13 +160,10 @@ function evaluateBids(db, announcementId) {
 
     validBids.forEach(bid => {
         const supplier = queryOne(db, 'SELECT * FROM suppliers WHERE id = ?', [bid.supplier_id]);
-
         const technicalScore = bid.technical_score || 0;
         const businessScore = bid.business_score || 0;
         const bidPrice = bid.bid_price || 0;
-
         const priceScore = calculatePriceScore(allPrices, bidPrice, announcement.procurement_method);
-
         const totalScore = Math.round(
             (technicalScore * rule.technical_weight +
              businessScore * rule.business_weight +
@@ -154,9 +172,7 @@ function evaluateBids(db, announcementId) {
 
         const priceAlerts = checkPriceAlert(bidPrice, allPrices, budget);
         const isOverBudget = budget > 0 && bidPrice > budget;
-        if (isOverBudget) {
-            overBudgetSuppliers.add(bid.supplier_id);
-        }
+        if (isOverBudget) overBudgetSuppliers.add(bid.supplier_id);
 
         const evalId = generateId('EVAL');
         queryRun(db,
@@ -207,7 +223,13 @@ function evaluateBids(db, announcementId) {
 
         if (existingReview) {
             reviewId = existingReview.review_id;
-            reviewStatus = existingReview.status === 'passed' ? 'passed' : 'pending';
+            if (existingReview.status === 'passed') {
+                reviewStatus = 'passed';
+            } else if (existingReview.status === 'failed') {
+                reviewStatus = 'failed';
+            } else {
+                reviewStatus = 'pending';
+            }
         } else {
             reviewId = generateId('QRV');
             reviewStatus = 'pending';
@@ -229,18 +251,41 @@ function evaluateBids(db, announcementId) {
                 "SELECT id FROM notifications WHERE related_id = ? AND related_type = 'qualification_review'",
                 [reviewId]
             );
+            const updatedContent = `项目"${announcement.title}"第${candidate.ranking}名候选人"${candidate.supplier_name}"需进行资格复核（复核状态：${reviewStatus}）`;
             if (oldNotifs.length === 0) {
-                notifySupervisor(db, '资格复核工单',
-                    `项目"${announcement.title}"第${candidate.ranking}名候选人"${candidate.supplier_name}"需进行资格复核`,
-                    'warning', reviewId, 'qualification_review');
+                notifySupervisor(db, '资格复核工单', updatedContent, 'warning', reviewId, 'qualification_review');
             } else {
                 queryRun(db,
-                    "UPDATE notifications SET content = ?, title = ? WHERE related_id = ? AND related_type = 'qualification_review'",
-                    [`项目"${announcement.title}"第${candidate.ranking}名候选人"${candidate.supplier_name}"需进行资格复核`, '资格复核工单', reviewId]
+                    "UPDATE notifications SET content = ? WHERE related_id = ? AND related_type = 'qualification_review'",
+                    [updatedContent, reviewId]
                 );
             }
         }
     });
+
+    const droppedCandidates = evaluationResults.filter(r =>
+        !r.is_candidate && existingCandidateMap[r.supplier_id] === 1 && !existingReviewMap[r.supplier_id]
+    );
+    if (isReEvaluation) {
+        Object.keys(existingReviewMap).forEach(supplierId => {
+            const stillInTop = topCandidates.find(c => c.supplier_id === supplierId);
+            if (!stillInTop) {
+                const review = existingReviewMap[supplierId];
+                const oldNotifs = queryAll(db,
+                    "SELECT id FROM notifications WHERE related_id = ? AND related_type = 'qualification_review'",
+                    [review.review_id]
+                );
+                const droppedSupplier = evaluationResults.find(r => r.supplier_id === supplierId);
+                const updatedContent = `项目"${announcement.title}"候选人"${droppedSupplier ? droppedSupplier.supplier_name : supplierId}"已不在前两名，原复核工单保留（复核状态：${review.status}）`;
+                if (oldNotifs.length > 0) {
+                    queryRun(db,
+                        "UPDATE notifications SET content = ? WHERE related_id = ? AND related_type = 'qualification_review'",
+                        [updatedContent, review.review_id]
+                    );
+                }
+            }
+        });
+    }
 
     const round = isReEvaluation ? (queryOne(db,
         'SELECT MAX(round) as max_round FROM evaluation_history WHERE announcement_id = ?',
@@ -261,20 +306,23 @@ function evaluateBids(db, announcementId) {
          VALUES (?, ?, ?, ?, ?, ?)`,
         [historyId, announcementId, round, isReEvaluation ? 1 : 0,
          JSON.stringify(evaluationResults.map(r => ({
-             supplier_name: r.supplier_name,
-             supplier_id: r.supplier_id,
-             technical_score: r.technical_score,
-             business_score: r.business_score,
-             price_score: r.price_score,
-             bid_price: r.bid_price,
-             total_score: r.total_score,
-             ranking: r.ranking,
-             is_candidate: r.is_candidate,
-             is_over_budget: r.is_over_budget,
-             price_alerts: r.price_alerts
+             supplier_name: r.supplier_name, supplier_id: r.supplier_id,
+             technical_score: r.technical_score, business_score: r.business_score,
+             price_score: r.price_score, bid_price: r.bid_price,
+             total_score: r.total_score, ranking: r.ranking,
+             is_candidate: r.is_candidate, is_over_budget: r.is_over_budget,
+             price_alerts: r.price_alerts,
+             qualification_review_status: r.qualification_review_status
          }))),
          rankingChanges.length > 0 ? JSON.stringify(rankingChanges) : null]
     );
+
+    addAuditLog(db, {
+        announcementId, actionType: isReEvaluation ? 're_evaluation' : 'evaluation',
+        operatorId: '', operatorName: 'system',
+        beforeStatus: beforeStatus, afterStatus: 'evaluated',
+        detail: `第${round}轮评标完成，${validBids.length}家有效投标，前2名触发资格复核`
+    });
 
     if (announcement.status !== 'awarded') {
         queryRun(db,
@@ -287,32 +335,24 @@ function evaluateBids(db, announcementId) {
         evaluationResults.forEach(result => {
             notifySupplier(db, result.supplier_id, '评标结果通知',
                 `项目"${announcement.title}"评标完成，您的综合得分：${result.total_score}分，排名：第${result.ranking}名`,
-                result.is_candidate ? 'success' : 'info',
-                announcementId, 'evaluation');
+                result.is_candidate ? 'success' : 'info', announcementId, 'evaluation');
         });
-
         notifyPurchaser(db, announcement.request_id, '评标完成',
-            `项目"${announcement.title}"评标完成，共${evaluationResults.length}家有效投标，已生成中标候选人排序`,
-            'info');
+            `项目"${announcement.title}"评标完成，共${evaluationResults.length}家有效投标，已生成中标候选人排序`, 'info');
         notifySupervisor(db, '评标完成',
-            `项目"${announcement.title}"评标完成，前2名已触发资格复核`,
+            `项目"${announcement.title}"评标完成，前2名已触发资格复核`, 'info', announcementId, 'evaluation');
+    } else if (rankingChanges.length > 0) {
+        notifyPurchaser(db, announcement.request_id, '评标结果更新',
+            `项目"${announcement.title}"重新评标完成，排名或分数有变化`, 'info');
+        notifySupervisor(db, '评标结果更新',
+            `项目"${announcement.title}"重新评标完成，排名或分数有变化：${rankingChanges.map(c => `${c.supplier_name}(${[c.ranking_change, c.score_change].filter(Boolean).join(',')})`).join('; ')}`,
             'info', announcementId, 'evaluation');
-    } else {
-        if (rankingChanges.length > 0) {
-            notifyPurchaser(db, announcement.request_id, '评标结果更新',
-                `项目"${announcement.title}"重新评标完成，排名或分数有变化`,
-                'info');
-            notifySupervisor(db, '评标结果更新',
-                `项目"${announcement.title}"重新评标完成，排名或分数有变化：${rankingChanges.map(c => `${c.supplier_name}(${[c.ranking_change, c.score_change].filter(Boolean).join(',')})`).join('; ')}`,
-                'info', announcementId, 'evaluation');
-        }
     }
 
     const overBudgetAlerts = evaluationResults.filter(r => r.is_over_budget);
     if (overBudgetAlerts.length > 0) {
         notifyPurchaser(db, announcement.request_id, '超预算报价提醒',
-            `项目"${announcement.title}"有${overBudgetAlerts.length}家供应商报价超过预算，已排除中标候选`,
-            'warning');
+            `项目"${announcement.title}"有${overBudgetAlerts.length}家供应商报价超过预算，已排除中标候选`, 'warning');
         notifySupervisor(db, '超预算报价提醒',
             `项目"${announcement.title}"供应商${overBudgetAlerts.map(r => r.supplier_name).join('、')}报价超过预算￥${budget}`,
             'warning', announcementId, 'evaluation');
@@ -321,8 +361,7 @@ function evaluateBids(db, announcementId) {
     const lowPriceAlerts = evaluationResults.filter(r => r.price_alerts.some(a => a.type === 'abnormally_low'));
     if (lowPriceAlerts.length > 0) {
         notifyPurchaser(db, announcement.request_id, '低价报价风险提示',
-            `项目"${announcement.title}"供应商${lowPriceAlerts.map(r => r.supplier_name).join('、')}报价明显偏低`,
-            'warning');
+            `项目"${announcement.title}"供应商${lowPriceAlerts.map(r => r.supplier_name).join('、')}报价明显偏低`, 'warning');
     }
 
     return {
@@ -378,6 +417,7 @@ function reviewQualification(db, reviewId, status, reviewedBy) {
         return { success: false, message: '复核状态只能是passed或failed' };
     }
 
+    const beforeStatus = evalRecord.qualification_review_status;
     queryRun(db,
         'UPDATE evaluations SET qualification_review_status = ? WHERE qualification_review_id = ?',
         [status, reviewId]
@@ -385,21 +425,21 @@ function reviewQualification(db, reviewId, status, reviewedBy) {
 
     const announcement = queryOne(db, 'SELECT * FROM bidding_announcements WHERE id = ?', [evalRecord.announcement_id]);
 
-    if (status === 'passed') {
-        notifySupplier(db, evalRecord.supplier_id, '资格复核通过',
-            `项目"${announcement ? announcement.title : ''}"资格复核已通过`,
-            'success', reviewId, 'qualification_review');
-        notifySupervisor(db, '资格复核结果',
-            `项目"${announcement ? announcement.title : ''}"候选人"${evalRecord.supplier_name}"资格复核通过，审核人：${reviewedBy}`,
-            'info', reviewId, 'qualification_review');
-    } else {
-        notifySupplier(db, evalRecord.supplier_id, '资格复核未通过',
-            `项目"${announcement ? announcement.title : ''}"资格复核未通过`,
-            'warning', reviewId, 'qualification_review');
-        notifySupervisor(db, '资格复核结果',
-            `项目"${announcement ? announcement.title : ''}"候选人"${evalRecord.supplier_name}"资格复核未通过，审核人：${reviewedBy}`,
-            'warning', reviewId, 'qualification_review');
-    }
+    addAuditLog(db, {
+        announcementId: evalRecord.announcement_id, actionType: 'qualification_review',
+        operatorId: reviewedBy, operatorName: reviewedBy,
+        beforeStatus: beforeStatus || 'pending', afterStatus: status,
+        detail: `候选人"${evalRecord.supplier_name}"资格复核${status === 'passed' ? '通过' : '不通过'}`,
+        supplierId: evalRecord.supplier_id, supplierName: evalRecord.supplier_name
+    });
+
+    const statusText = status === 'passed' ? '通过' : '不通过';
+    notifySupplier(db, evalRecord.supplier_id, `资格复核${statusText}`,
+        `项目"${announcement ? announcement.title : ''}"资格复核${statusText}`,
+        status === 'passed' ? 'success' : 'warning', reviewId, 'qualification_review');
+    notifySupervisor(db, '资格复核结果',
+        `项目"${announcement ? announcement.title : ''}"候选人"${evalRecord.supplier_name}"资格复核${statusText}，审核人：${reviewedBy}`,
+        status === 'passed' ? 'info' : 'warning', reviewId, 'qualification_review');
 
     return {
         success: true,

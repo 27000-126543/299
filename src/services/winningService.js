@@ -1,10 +1,37 @@
 const { queryAll, queryOne, queryRun, generateId } = require('../database/helpers');
 const { notifySupplier, notifySupervisor, notifyPurchaser } = require('./notificationService');
+const { hasPendingObjections, addAuditLog } = require('./objectionService');
 
 function approveWinningResult(db, announcementId, approvedBy) {
     const announcement = queryOne(db, 'SELECT * FROM bidding_announcements WHERE id = ?', [announcementId]);
     if (!announcement) {
         return { success: false, message: '招标公告不存在' };
+    }
+
+    if (hasPendingObjections(db, announcementId)) {
+        const pendingObjections = queryAll(db,
+            'SELECT * FROM objections WHERE announcement_id = ? AND status = ?',
+            [announcementId, 'pending']
+        );
+        addAuditLog(db, {
+            announcementId, actionType: 'winning_approval_blocked',
+            operatorId: approvedBy, operatorName: approvedBy,
+            beforeStatus: announcement.status, afterStatus: announcement.status,
+            detail: `中标审批被拦截：存在${pendingObjections.length}条未处理异议`
+        });
+        return {
+            success: false,
+            message: `存在${pendingObjections.length}条未处理异议，请先处理异议后再审批中标`,
+            data: {
+                pending_objections: pendingObjections.map(o => ({
+                    objection_id: o.id,
+                    supplier_name: o.supplier_name,
+                    objection_type: o.objection_type,
+                    objection_content: o.objection_content,
+                    status: o.status
+                }))
+            }
+        };
     }
 
     const evaluations = queryAll(db,
@@ -21,6 +48,12 @@ function approveWinningResult(db, announcementId, approvedBy) {
     const failedEvaluations = evaluations.filter(e => e.qualification_review_status === 'failed');
 
     if (passedEvaluations.length === 0) {
+        addAuditLog(db, {
+            announcementId, actionType: 'winning_approval_blocked',
+            operatorId: approvedBy, operatorName: approvedBy,
+            beforeStatus: announcement.status, afterStatus: announcement.status,
+            detail: `中标审批失败：所有候选人均未通过资格复核（${failedEvaluations.length}人不通过，${pendingEvaluations.length}人待复核）`
+        });
         return {
             success: false,
             message: `所有候选人均未通过资格复核（${failedEvaluations.length}人不通过，${pendingEvaluations.length}人待复核），无法审批中标`,
@@ -44,6 +77,7 @@ function approveWinningResult(db, announcementId, approvedBy) {
     }
 
     const isFallback = winner.ranking > 1;
+    const beforeStatus = announcement.status;
 
     const existingResult = queryOne(db,
         'SELECT * FROM winning_results WHERE announcement_id = ?',
@@ -93,11 +127,9 @@ function approveWinningResult(db, announcementId, approvedBy) {
             [contractId, resultId, announcementId, announcement.purchaser_id,
              announcement.purchaser_id, winner.supplier_id,
              supplier ? supplier.name : '',
-             announcement.title + '采购合同',
-             winAmount,
+             announcement.title + '采购合同', winAmount,
              announcement.bid_opening_date,
-             contractDraft.breach_clause,
-             contractDraft.penalty_rate]
+             contractDraft.breach_clause, contractDraft.penalty_rate]
         );
     }
 
@@ -107,6 +139,14 @@ function approveWinningResult(db, announcementId, approvedBy) {
         `UPDATE bidding_announcements SET status = 'awarded', updated_at = datetime('now','localtime') WHERE id = ?`,
         [announcementId]
     );
+
+    addAuditLog(db, {
+        announcementId, actionType: 'winning_approval',
+        operatorId: approvedBy, operatorName: approvedBy,
+        beforeStatus: beforeStatus, afterStatus: 'awarded',
+        detail: `中标审批完成，中标供应商：${supplier ? supplier.name : ''}，中标金额：￥${winAmount.toFixed(2)}${isFallback ? '（顺延）' : ''}`,
+        supplierId: winner.supplier_id, supplierName: supplier ? supplier.name : ''
+    });
 
     notifySupplier(db, winner.supplier_id, '中标通知',
         `恭喜您中标项目"${announcement.title}"，中标金额：￥${winAmount.toFixed(2)}，请及时确认合同`,
@@ -152,7 +192,7 @@ function approveWinningResult(db, announcementId, approvedBy) {
 }
 
 function generateResultAnnouncement(announcement, winner, supplier, winAmount, isFallback, failedEvaluations) {
-    const result = {
+    return {
         title: `中标结果公告 - ${announcement.title}`,
         announcement_no: announcement.announcement_no,
         project_name: announcement.title,
@@ -169,13 +209,11 @@ function generateResultAnnouncement(announcement, winner, supplier, winAmount, i
         })),
         published_at: new Date().toISOString()
     };
-    return result;
 }
 
 function generateContractDraft(announcement, winner, supplier, resultId, winAmount) {
     const penaltyRate = 0.0005;
     const maxPenaltyRate = 0.05;
-
     return {
         title: `${announcement.title}采购合同`,
         party_a: announcement.purchaser_id,
