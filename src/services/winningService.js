@@ -19,6 +19,8 @@ function approveWinningResult(db, announcementId, approvedBy) {
     const winner = evaluations[0];
     const supplier = queryOne(db, 'SELECT * FROM suppliers WHERE id = ?', [winner.supplier_id]);
 
+    const winAmount = winner.bid_price || announcement.budget;
+
     const existingResult = queryOne(db,
         'SELECT * FROM winning_results WHERE announcement_id = ? AND supplier_id = ?',
         [announcementId, winner.supplier_id]
@@ -28,12 +30,11 @@ function approveWinningResult(db, announcementId, approvedBy) {
     if (existingResult) {
         resultId = existingResult.id;
         queryRun(db,
-            `UPDATE winning_results SET status = 'approved', approved_by = ?, approved_at = datetime('now','localtime') WHERE id = ?`,
-            [approvedBy, resultId]
+            `UPDATE winning_results SET status = 'approved', win_amount = ?, approved_by = ?, approved_at = datetime('now','localtime') WHERE id = ?`,
+            [winAmount, approvedBy, resultId]
         );
     } else {
         resultId = generateId('WIN');
-        const winAmount = announcement.budget * (0.85 + Math.random() * 0.1);
         queryRun(db,
             `INSERT INTO winning_results (id, announcement_id, supplier_id, supplier_name, total_score, win_amount, status, approved_by, approved_at)
              VALUES (?, ?, ?, ?, ?, ?, 'approved', ?, datetime('now','localtime'))`,
@@ -42,12 +43,12 @@ function approveWinningResult(db, announcementId, approvedBy) {
         );
     }
 
-    const resultAnnouncementContent = generateResultAnnouncement(announcement, winner, supplier);
+    const resultAnnouncementContent = generateResultAnnouncement(announcement, winner, supplier, winAmount);
     const resultAnnId = generateId('RAN');
     queryRun(db, 'UPDATE winning_results SET result_announcement_id = ? WHERE id = ?', [resultAnnId, resultId]);
 
     const contractId = generateId('CON');
-    const contractDraft = generateContractDraft(announcement, winner, supplier, resultId);
+    const contractDraft = generateContractDraft(announcement, winner, supplier, resultId, winAmount);
     queryRun(db,
         `INSERT INTO contracts
          (id, winning_result_id, announcement_id, purchaser_id, purchaser_name, supplier_id, supplier_name,
@@ -57,7 +58,7 @@ function approveWinningResult(db, announcementId, approvedBy) {
          announcement.purchaser_id, winner.supplier_id,
          supplier ? supplier.name : '',
          announcement.title + '采购合同',
-         contractDraft.amount,
+         winAmount,
          announcement.bid_opening_date,
          contractDraft.breach_clause,
          contractDraft.penalty_rate]
@@ -71,13 +72,13 @@ function approveWinningResult(db, announcementId, approvedBy) {
     );
 
     notifySupplier(db, winner.supplier_id, '中标通知',
-        `恭喜您中标项目"${announcement.title}"，中标金额：￥${contractDraft.amount.toFixed(2)}，请及时确认合同`,
+        `恭喜您中标项目"${announcement.title}"，中标金额：￥${winAmount.toFixed(2)}，请及时确认合同`,
         'success', announcementId, 'winning_result');
     notifyPurchaser(db, announcement.request_id, '中标结果审批完成',
-        `项目"${announcement.title}"中标结果已审批，中标供应商：${supplier ? supplier.name : ''}，合同草稿已生成`,
+        `项目"${announcement.title}"中标结果已审批，中标供应商：${supplier ? supplier.name : ''}，中标金额：￥${winAmount.toFixed(2)}，合同草稿已生成`,
         'success');
     notifySupervisor(db, '中标公告已发布',
-        `项目"${announcement.title}"中标结果已审批并发布公告`,
+        `项目"${announcement.title}"中标结果已审批并发布公告，中标金额：￥${winAmount.toFixed(2)}`,
         'info', resultAnnId, 'result_announcement');
 
     const otherCandidates = evaluations.slice(1);
@@ -91,6 +92,7 @@ function approveWinningResult(db, announcementId, approvedBy) {
         success: true,
         data: {
             result_id: resultId,
+            win_amount: winAmount,
             winner: {
                 supplier_id: winner.supplier_id,
                 supplier_name: supplier ? supplier.name : '',
@@ -104,7 +106,7 @@ function approveWinningResult(db, announcementId, approvedBy) {
     };
 }
 
-function generateResultAnnouncement(announcement, winner, supplier) {
+function generateResultAnnouncement(announcement, winner, supplier, winAmount) {
     return {
         title: `中标结果公告 - ${announcement.title}`,
         announcement_no: announcement.announcement_no,
@@ -112,13 +114,12 @@ function generateResultAnnouncement(announcement, winner, supplier) {
         procurement_method: announcement.procurement_method,
         winner_name: supplier ? supplier.name : '',
         winner_score: winner.total_score,
-        win_amount: announcement.budget,
+        win_amount: winAmount,
         published_at: new Date().toISOString()
     };
 }
 
-function generateContractDraft(announcement, winner, supplier, resultId) {
-    const amount = announcement.budget * (0.85 + Math.random() * 0.1);
+function generateContractDraft(announcement, winner, supplier, resultId, winAmount) {
     const penaltyRate = 0.0005;
     const maxPenaltyRate = 0.05;
 
@@ -126,7 +127,7 @@ function generateContractDraft(announcement, winner, supplier, resultId) {
         title: `${announcement.title}采购合同`,
         party_a: announcement.purchaser_id,
         party_b: supplier ? supplier.name : '',
-        amount: Math.round(amount * 100) / 100,
+        amount: winAmount,
         signing_date: new Date().toISOString().slice(0, 10),
         delivery_date: announcement.bid_opening_date,
         breach_clause: `逾期交货每日按合同金额的${(penaltyRate * 100).toFixed(2)}%计算违约金，最高不超过合同金额的${(maxPenaltyRate * 100).toFixed(0)}%；验收不合格按合同金额的5%计算违约金`,

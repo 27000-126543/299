@@ -2,19 +2,50 @@ const { queryAll, queryOne, queryRun, generateId } = require('../database/helper
 const { notifySupplier, notifySupervisor, notifyPurchaser } = require('./notificationService');
 
 const MIN_CREDIT_SCORE = 60;
-const REQUIRED_QUALIFICATIONS = {
-    '工程类': ['建筑工程施工总承包', '市政公用工程施工总承包', '甲级', '一级'],
+
+const CATEGORY_REQUIRED_QUALIFICATIONS = {
+    '工程类': ['建筑工程施工总承包', '市政公用工程施工总承包', '甲级', '一级', '特级'],
     '货物类': ['生产许可证', '经营许可证', '产品认证'],
     '服务类': ['资质证书', '行业许可']
 };
 
 function checkQualification(supplier, category) {
     if (supplier.status !== 'active') {
-        return { passed: false, reason: '供应商状态非正常' };
+        return { passed: false, reason: '供应商状态非正常', missing_qualifications: [] };
     }
 
     if (supplier.credit_score < MIN_CREDIT_SCORE) {
-        return { passed: false, reason: `信用评分${supplier.credit_score}分，低于最低要求${MIN_CREDIT_SCORE}分` };
+        return { passed: false, reason: `信用评分${supplier.credit_score}分，低于最低要求${MIN_CREDIT_SCORE}分`, missing_qualifications: [] };
+    }
+
+    const requiredQualifications = CATEGORY_REQUIRED_QUALIFICATIONS[category];
+    if (!requiredQualifications || requiredQualifications.length === 0) {
+        return { passed: true, reason: '资质校验通过' };
+    }
+
+    let qualStr = supplier.qualifications || '';
+    if (Buffer.isBuffer(qualStr)) {
+        qualStr = qualStr.toString('utf8');
+    }
+    const supplierQualifications = qualStr.split(',').map(q => q.trim()).filter(q => q);
+    if (supplierQualifications.length === 0) {
+        return {
+            passed: false,
+            reason: `${category}项目要求供应商具备以下资质之一：${requiredQualifications.join('、')}，该供应商未持有任何资质`,
+            missing_qualifications: requiredQualifications
+        };
+    }
+
+    const hasMatching = requiredQualifications.some(req =>
+        supplierQualifications.some(sup => sup.includes(req) || req.includes(sup))
+    );
+
+    if (!hasMatching) {
+        return {
+            passed: false,
+            reason: `${category}项目要求供应商具备以下资质之一：${requiredQualifications.join('、')}，该供应商持有资质（${supplierQualifications.join('、')}）均不匹配`,
+            missing_qualifications: requiredQualifications
+        };
     }
 
     return { passed: true, reason: '资质校验通过' };
@@ -108,7 +139,8 @@ function registerSupplier(db, announcementId, supplierId) {
         return {
             success: false,
             message: '资质校验未通过，报名被拒绝',
-            reason: qualCheck.reason
+            reason: qualCheck.reason,
+            missing_qualifications: qualCheck.missing_qualifications
         };
     }
 

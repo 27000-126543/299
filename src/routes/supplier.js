@@ -17,15 +17,16 @@ router.get('/:id', (req, res) => {
 router.post('/', (req, res) => {
     const db = getDb();
     const id = generateId('SUP');
-    const { name, unified_code, category, qualification_level, contact_person, contact_phone, email, address } = req.body;
+    const { name, unified_code, category, qualification_level, qualifications, contact_person, contact_phone, email, address } = req.body;
     if (!name || !unified_code) {
         return res.status(400).json({ success: false, message: 'name和unified_code必填' });
     }
     try {
         queryRun(db,
-            `INSERT INTO suppliers (id, name, unified_code, category, qualification_level, contact_person, contact_phone, email, address)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            `INSERT INTO suppliers (id, name, unified_code, category, qualification_level, qualifications, contact_person, contact_phone, email, address)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [id, name, unified_code, category || '', qualification_level || '',
+             qualifications || '',
              contact_person || '', contact_phone || '', email || '', address || '']
         );
         saveDatabase();

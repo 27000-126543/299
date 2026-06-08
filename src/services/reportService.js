@@ -8,10 +8,6 @@ function generateDailyReport(db, reportDate) {
         `SELECT COUNT(*) as count FROM procurement_requests WHERE date(created_at) = ?`,
         [date]
     );
-    const approvedProjects = queryOne(db,
-        `SELECT COUNT(*) as count FROM procurement_requests WHERE status = 'approved' AND date(updated_at) = ?`,
-        [date]
-    );
 
     const amountResult = queryOne(db,
         `SELECT COALESCE(SUM(budget), 0) as total_budget FROM procurement_requests WHERE date(created_at) = ?`,
@@ -30,10 +26,12 @@ function generateDailyReport(db, reportDate) {
         : 0;
 
     const totalBidResult = queryOne(db,
-        `SELECT COUNT(*) as count FROM bidding_announcements WHERE date(updated_at) <= ? AND status IN ('evaluated','awarded','failed_bid')`
+        `SELECT COUNT(*) as count FROM bidding_announcements WHERE date(updated_at) = ? AND status IN ('evaluated','awarded','failed_bid')`,
+        [date]
     );
     const failedBidResult = queryOne(db,
-        `SELECT COUNT(*) as count FROM bidding_announcements WHERE date(updated_at) <= ? AND status = 'failed_bid'`
+        `SELECT COUNT(*) as count FROM bidding_announcements WHERE date(updated_at) = ? AND status = 'failed_bid'`,
+        [date]
     );
 
     const totalBidCount = totalBidResult ? totalBidResult.count : 0;
@@ -78,7 +76,21 @@ function generateDailyReport(db, reportDate) {
              breachCount ? breachCount.count : 0,
              details, date]
         );
-        return { ...existing, total_projects: totalProjects ? totalProjects.count : 0 };
+        return {
+            id: existing.id,
+            report_date: date,
+            total_projects: totalProjects ? totalProjects.count : 0,
+            total_amount: contractAmount,
+            budget_amount: budgetAmount,
+            saving_rate: savingRate,
+            failed_bid_count: failedBidCount,
+            total_bid_count: totalBidCount,
+            failed_bid_rate: failedBidRate,
+            completed_count: completedCount ? completedCount.count : 0,
+            breach_count: breachCount ? breachCount.count : 0,
+            by_category: byCategory,
+            by_method: byMethod
+        };
     }
 
     queryRun(db,
@@ -159,7 +171,20 @@ async function exportReportToExcel(db, filters = {}) {
     ];
 
     summarySheet.getRow(1).font = { bold: true };
-    reports.forEach(r => summarySheet.addRow(r));
+    reports.forEach(r => {
+        summarySheet.addRow({
+            report_date: r.report_date,
+            total_projects: r.total_projects,
+            budget_amount: r.budget_amount,
+            total_amount: r.total_amount,
+            saving_rate: r.saving_rate,
+            failed_bid_count: r.failed_bid_count,
+            total_bid_count: r.total_bid_count,
+            failed_bid_rate: r.failed_bid_rate,
+            completed_count: r.completed_count,
+            breach_count: r.breach_count
+        });
+    });
 
     const categorySheet = workbook.addWorksheet('按品目分类');
     categorySheet.columns = [

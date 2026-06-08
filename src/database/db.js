@@ -19,6 +19,7 @@ async function initDatabase() {
         db = new SQL.Database();
     }
     createTables();
+    migrateDatabase();
     return db;
 }
 
@@ -74,6 +75,7 @@ function createTables() {
             unified_code TEXT UNIQUE,
             category TEXT,
             qualification_level TEXT,
+            qualifications TEXT,
             credit_score INTEGER DEFAULT 100,
             contact_person TEXT,
             contact_phone TEXT,
@@ -118,6 +120,9 @@ function createTables() {
             missing_files TEXT,
             is_valid INTEGER DEFAULT 1,
             invalid_reason TEXT,
+            bid_price DECIMAL(15,2) DEFAULT 0,
+            technical_score DECIMAL(5,2) DEFAULT 0,
+            business_score DECIMAL(5,2) DEFAULT 0,
             submitted_at TEXT DEFAULT (datetime('now','localtime')),
             FOREIGN KEY (registration_id) REFERENCES supplier_registrations(id),
             FOREIGN KEY (supplier_id) REFERENCES suppliers(id),
@@ -282,6 +287,39 @@ function createTables() {
     saveDatabase();
 }
 
+function migrateDatabase() {
+    if (!db) return;
+    try {
+        let stmt = db.prepare("PRAGMA table_info(bid_documents)");
+        let colNames = [];
+        while (stmt.step()) {
+            colNames.push(stmt.getAsObject().name);
+        }
+        stmt.free();
+        if (!colNames.includes('bid_price')) {
+            db.run('ALTER TABLE bid_documents ADD COLUMN bid_price DECIMAL(15,2) DEFAULT 0');
+        }
+        if (!colNames.includes('technical_score')) {
+            db.run('ALTER TABLE bid_documents ADD COLUMN technical_score DECIMAL(5,2) DEFAULT 0');
+        }
+        if (!colNames.includes('business_score')) {
+            db.run('ALTER TABLE bid_documents ADD COLUMN business_score DECIMAL(5,2) DEFAULT 0');
+        }
+
+        stmt = db.prepare("PRAGMA table_info(suppliers)");
+        colNames = [];
+        while (stmt.step()) {
+            colNames.push(stmt.getAsObject().name);
+        }
+        stmt.free();
+        if (!colNames.includes('qualifications')) {
+            db.run('ALTER TABLE suppliers ADD COLUMN qualifications TEXT');
+        }
+
+        saveDatabase();
+    } catch (e) { /* ignore migration errors for new databases */ }
+}
+
 function saveDatabase() {
     if (!db) return;
     const data = db.export();
@@ -297,4 +335,4 @@ function getDb() {
     return db;
 }
 
-module.exports = { initDatabase, getDb, saveDatabase };
+module.exports = { initDatabase, getDb, saveDatabase, migrateDatabase };

@@ -16,6 +16,9 @@ function confirmContract(db, contractId) {
     notifyPurchaser(db, getRequestIdByContract(db, contractId), '合同已生效',
         `合同"${contract.title}"已确认生效`,
         'success');
+    notifySupervisor(db, '合同已生效',
+        `合同"${contract.title}"已确认生效，供应商：${contract.supplier_name}，金额：￥${contract.amount.toFixed(2)}`,
+        'info', contractId, 'contract');
     return { success: true, data: { contract_id: contractId, status: 'in_effect' } };
 }
 
@@ -140,6 +143,9 @@ function acceptContract(db, contractId) {
     notifyPurchaser(db, getRequestIdByContract(db, contractId), '合同验收合格',
         `合同"${contract.title}"验收合格`,
         'success');
+    notifySupervisor(db, '合同验收合格',
+        `合同"${contract.title}"验收合格，供应商：${contract.supplier_name}`,
+        'info', contractId, 'contract');
     return { success: true, data: { contract_id: contractId, status: 'accepted' } };
 }
 

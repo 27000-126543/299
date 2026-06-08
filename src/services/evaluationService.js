@@ -8,6 +8,12 @@ function getEvaluationRule(db, category, method) {
     );
     if (!rule) {
         rule = queryOne(db,
+            "SELECT * FROM evaluation_rules WHERE category = 'default' AND procurement_method = ? AND is_active = 1",
+            [method]
+        );
+    }
+    if (!rule) {
+        rule = queryOne(db,
             "SELECT * FROM evaluation_rules WHERE category = 'default' AND is_active = 1"
         );
     }
@@ -22,20 +28,21 @@ function getEvaluationRule(db, category, method) {
     return rule;
 }
 
-function calculatePriceScore(prices, supplierPrice, method) {
-    if (prices.length === 0) return 0;
+function calculatePriceScore(allPrices, supplierPrice, method) {
+    const validPrices = allPrices.filter(p => p > 0);
+    if (validPrices.length === 0 || supplierPrice <= 0) return 0;
 
     let benchmarkPrice;
     if (method === '公开招标') {
-        prices.sort((a, b) => a - b);
-        if (prices.length >= 5) {
-            const trimmed = prices.slice(1, -1);
+        const sorted = [...validPrices].sort((a, b) => a - b);
+        if (sorted.length >= 5) {
+            const trimmed = sorted.slice(1, -1);
             benchmarkPrice = trimmed.reduce((a, b) => a + b, 0) / trimmed.length;
         } else {
-            benchmarkPrice = prices.reduce((a, b) => a + b, 0) / prices.length;
+            benchmarkPrice = sorted.reduce((a, b) => a + b, 0) / sorted.length;
         }
     } else {
-        benchmarkPrice = Math.min(...prices);
+        benchmarkPrice = Math.min(...validPrices);
     }
 
     if (supplierPrice <= benchmarkPrice) {
@@ -84,25 +91,18 @@ function evaluateBids(db, announcementId) {
         queryRun(db, 'DELETE FROM evaluations WHERE announcement_id = ?', [announcementId]);
     }
 
-    const bidPrices = validBids.map(bd => {
-        const reg = queryOne(db, 'SELECT * FROM supplier_registrations WHERE id = ?', [bd.registration_id]);
-        return reg ? (reg.deposit_amount || 0) : 0;
-    });
+    const allPrices = validBids.map(bd => bd.bid_price || 0);
 
     const evaluationResults = [];
 
     validBids.forEach(bid => {
         const supplier = queryOne(db, 'SELECT * FROM suppliers WHERE id = ?', [bid.supplier_id]);
-        const reg = queryOne(db, 'SELECT * FROM supplier_registrations WHERE id = ?', [bid.registration_id]);
 
-        const technicalScore = Math.round((60 + Math.random() * 35) * 100) / 100;
-        const businessScore = Math.round((60 + Math.random() * 35) * 100) / 100;
-        const bidPrice = reg ? (announcement.budget * (0.7 + Math.random() * 0.25)) : 0;
-        const priceScore = calculatePriceScore(
-            validBids.map(() => announcement.budget * (0.7 + Math.random() * 0.25)),
-            bidPrice,
-            announcement.procurement_method
-        );
+        const technicalScore = bid.technical_score || 0;
+        const businessScore = bid.business_score || 0;
+        const bidPrice = bid.bid_price || 0;
+
+        const priceScore = calculatePriceScore(allPrices, bidPrice, announcement.procurement_method);
 
         const totalScore = Math.round(
             (technicalScore * rule.technical_weight +
@@ -126,6 +126,7 @@ function evaluateBids(db, announcementId) {
             technical_score: technicalScore,
             business_score: businessScore,
             price_score: priceScore,
+            bid_price: bidPrice,
             total_score: totalScore
         });
     });

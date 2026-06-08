@@ -2,26 +2,18 @@ const { queryAll, queryOne, queryRun, generateId } = require('../database/helper
 const { notifySupplier, notifySupervisor, notifyPurchaser } = require('./notificationService');
 
 const REQUIRED_BID_FILES = ['投标函', '技术方案', '报价单', '资格证明文件'];
+const CRITICAL_BID_FILES = ['投标函', '报价单'];
 
-function decryptBidFile(file) {
-    return {
-        success: true,
-        decrypted: true,
-        file_name: file.file_name,
-        original_hash: file.file_hash
-    };
-}
-
-function checkBidIntegrity(bidDoc, submittedFiles) {
-    const existingFiles = submittedFiles || [];
+function checkBidIntegrity(submittedFiles) {
+    const existingFiles = Array.isArray(submittedFiles) ? submittedFiles : [];
     const missing = REQUIRED_BID_FILES.filter(rf =>
         !existingFiles.some(f => f && f.includes(rf))
     );
+    const missingCritical = CRITICAL_BID_FILES.filter(rf =>
+        !existingFiles.some(f => f && f.includes(rf))
+    );
 
-    const hasBidLetter = existingFiles.some(f => f && f.includes('投标函'));
-    const hasPriceSheet = existingFiles.some(f => f && f.includes('报价单'));
-
-    if (!hasBidLetter || !hasPriceSheet) {
+    if (missingCritical.length > 0) {
         return {
             isComplete: false,
             isValid: false,
@@ -75,50 +67,37 @@ function openBids(db, announcementId) {
         );
 
         if (bidDocs.length === 0) {
+            const allMissing = [...REQUIRED_BID_FILES];
             const docId = generateId('BID');
-            const mockFiles = ['投标函', '技术方案', '报价单', '资格证明文件'];
-            if (Math.random() < 0.1) {
-                mockFiles.splice(0, 1);
-            }
-
-            const integrity = checkBidIntegrity(null, mockFiles);
-
             queryRun(db,
                 `INSERT INTO bid_documents
                  (id, registration_id, supplier_id, announcement_id, file_name, file_hash,
                   is_decrypted, integrity_check, missing_files, is_valid, invalid_reason)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                 [docId, reg.id, reg.supplier_id, announcementId,
-                 mockFiles.join(','), generateId('HASH'),
-                 1, integrity.isComplete ? 'passed' : 'failed',
-                 integrity.missingFiles.join(','),
-                 integrity.isValid ? 1 : 0,
-                 integrity.invalidReason]
+                 '', '',
+                 0, 'failed',
+                 allMissing.join(','),
+                 0, `缺少关键文件：${allMissing.join('、')}`]
             );
 
-            if (integrity.isValid) {
-                validCount++;
-            } else {
-                invalidCount++;
-            }
-
+            invalidCount++;
             results.push({
                 supplier_id: reg.supplier_id,
                 supplier_name: reg.supplier_name,
-                is_valid: integrity.isValid,
-                missing_files: integrity.missingFiles,
-                invalid_reason: integrity.invalidReason
+                is_valid: false,
+                missing_files: allMissing,
+                invalid_reason: `缺少关键文件：${allMissing.join('、')}`
             });
         } else {
             bidDocs.forEach(doc => {
-                const decryptResult = decryptBidFile(doc);
                 queryRun(db,
                     'UPDATE bid_documents SET is_decrypted = 1 WHERE id = ?',
                     [doc.id]
                 );
 
-                const submittedFiles = doc.file_name ? doc.file_name.split(',') : [];
-                const integrity = checkBidIntegrity(doc, submittedFiles);
+                const submittedFiles = doc.file_name ? doc.file_name.split(',').map(f => f.trim()).filter(f => f) : [];
+                const integrity = checkBidIntegrity(submittedFiles);
 
                 queryRun(db,
                     `UPDATE bid_documents SET integrity_check = ?, missing_files = ?, is_valid = ?, invalid_reason = ? WHERE id = ?`,
@@ -195,14 +174,48 @@ function submitBidDocument(db, data) {
         return { success: false, message: '未找到有效的报名记录或保证金未缴纳' };
     }
 
+    const existing = queryOne(db,
+        'SELECT * FROM bid_documents WHERE registration_id = ? AND announcement_id = ?',
+        [reg.id, data.announcement_id]
+    );
+    if (existing) {
+        return { success: false, message: '该供应商已提交投标文件' };
+    }
+
     const id = generateId('BID');
+    const fileNames = data.file_name || '';
+    const bidPrice = data.bid_price || 0;
+    const technicalScore = data.technical_score || 0;
+    const businessScore = data.business_score || 0;
+
     queryRun(db,
-        `INSERT INTO bid_documents (id, registration_id, supplier_id, announcement_id, file_name, file_hash)
+        `INSERT INTO bid_documents
+         (id, registration_id, supplier_id, announcement_id, file_name, file_hash)
          VALUES (?, ?, ?, ?, ?, ?)`,
-        [id, reg.id, data.supplier_id, data.announcement_id, data.file_name || '', generateId('HASH')]
+        [id, reg.id, data.supplier_id, data.announcement_id, fileNames, generateId('HASH')]
     );
 
-    return { success: true, data: { id, registration_id: reg.id } };
+    if (bidPrice > 0) {
+        queryRun(db, 'UPDATE bid_documents SET bid_price = ? WHERE id = ?', [bidPrice, id]);
+    }
+    if (technicalScore > 0) {
+        queryRun(db, 'UPDATE bid_documents SET technical_score = ? WHERE id = ?', [technicalScore, id]);
+    }
+    if (businessScore > 0) {
+        queryRun(db, 'UPDATE bid_documents SET business_score = ? WHERE id = ?', [businessScore, id]);
+    }
+
+    return {
+        success: true,
+        data: {
+            id,
+            registration_id: reg.id,
+            file_name: fileNames,
+            bid_price: bidPrice,
+            technical_score: technicalScore,
+            business_score: businessScore
+        }
+    };
 }
 
 function getBidOpeningResult(db, announcementId) {
