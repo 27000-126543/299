@@ -1,0 +1,25 @@
+{
+  "name": "smart-procurement-api",
+  "version": "1.0.0",
+  "description": "智慧政府采购与招投标管理系统后端API",
+  "main": "src/app.js",
+  "scripts": {
+    "start": "node src/app.js",
+    "dev": "nodemon src/app.js",
+    "init-db": "node src/scripts/initDb.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "sql.js": "^1.10.3",
+    "exceljs": "^4.4.0",
+    "node-cron": "^3.0.3",
+    "uuid": "^9.0.0",
+    "dayjs": "^1.11.10",
+    "cors": "^2.8.5",
+    "helmet": "^7.1.0",
+    "morgan": "^1.10.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  }
+}
