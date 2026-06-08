@@ -316,6 +316,16 @@ function migrateDatabase() {
             db.run('ALTER TABLE suppliers ADD COLUMN qualifications TEXT');
         }
 
+        stmt = db.prepare("PRAGMA table_info(evaluations)");
+        colNames = [];
+        while (stmt.step()) {
+            colNames.push(stmt.getAsObject().name);
+        }
+        stmt.free();
+        if (!colNames.includes('bid_price')) {
+            db.run('ALTER TABLE evaluations ADD COLUMN bid_price DECIMAL(15,2) DEFAULT 0');
+        }
+
         saveDatabase();
     } catch (e) { /* ignore migration errors for new databases */ }
 }

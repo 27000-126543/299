@@ -58,7 +58,8 @@ function evaluateBids(db, announcementId) {
         return { success: false, message: '招标公告不存在' };
     }
 
-    if (announcement.status !== 'bid_opened') {
+    const validStatuses = ['bid_opened', 'evaluated', 'awarded'];
+    if (!validStatuses.includes(announcement.status)) {
         return { success: false, message: '项目尚未完成开标' };
     }
 
@@ -68,25 +69,42 @@ function evaluateBids(db, announcementId) {
     );
 
     if (validBids.length === 0) {
-        queryRun(db,
-            `UPDATE bidding_announcements SET status = 'failed_bid', updated_at = datetime('now','localtime') WHERE id = ?`,
-            [announcementId]
-        );
-        notifyPurchaser(db, announcement.request_id, '流标通知',
-            `项目"${announcement.title}"无有效投标，流标处理`,
-            'warning');
-        notifySupervisor(db, '项目流标',
-            `项目"${announcement.title}"无有效投标，流标处理`,
-            'warning', announcementId, 'bidding_announcement');
+        if (announcement.status !== 'failed_bid') {
+            queryRun(db,
+                `UPDATE bidding_announcements SET status = 'failed_bid', updated_at = datetime('now','localtime') WHERE id = ?`,
+                [announcementId]
+            );
+            notifyPurchaser(db, announcement.request_id, '流标通知',
+                `项目"${announcement.title}"无有效投标，流标处理`,
+                'warning');
+            notifySupervisor(db, '项目流标',
+                `项目"${announcement.title}"无有效投标，流标处理`,
+                'warning', announcementId, 'bidding_announcement');
+        }
         return { success: false, message: '无有效投标，流标处理' };
     }
 
     const rule = getEvaluationRule(db, announcement.category, announcement.procurement_method);
 
+    const isReEvaluation = queryOne(db,
+        'SELECT COUNT(*) as cnt FROM evaluations WHERE announcement_id = ?',
+        [announcementId]
+    ).cnt > 0;
+
+    if (isReEvaluation) {
+        queryRun(db,
+            `DELETE FROM notifications WHERE related_id IN (SELECT qualification_review_id FROM evaluations WHERE announcement_id = ? AND qualification_review_id IS NOT NULL) AND related_type = 'qualification_review'`,
+            [announcementId]
+        );
+    }
+
     const existingEvals = queryAll(db,
-        'SELECT * FROM evaluations WHERE announcement_id = ?',
+        'SELECT id, supplier_id FROM evaluations WHERE announcement_id = ?',
         [announcementId]
     );
+    const existingMap = {};
+    existingEvals.forEach(e => { existingMap[e.supplier_id] = e.id; });
+
     if (existingEvals.length > 0) {
         queryRun(db, 'DELETE FROM evaluations WHERE announcement_id = ?', [announcementId]);
     }
@@ -113,10 +131,10 @@ function evaluateBids(db, announcementId) {
         const evalId = generateId('EVAL');
         queryRun(db,
             `INSERT INTO evaluations
-             (id, announcement_id, supplier_id, supplier_name, technical_score, business_score, price_score, total_score)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+             (id, announcement_id, supplier_id, supplier_name, technical_score, business_score, price_score, total_score, bid_price)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [evalId, announcementId, bid.supplier_id,
-             supplier ? supplier.name : '', technicalScore, businessScore, priceScore, totalScore]
+             supplier ? supplier.name : '', technicalScore, businessScore, priceScore, totalScore, bidPrice]
         );
 
         evaluationResults.push({
@@ -154,36 +172,43 @@ function evaluateBids(db, announcementId) {
         candidate.qualification_review_status = 'pending';
         candidate.qualification_review_id = reviewId;
 
-        notifySupervisor(db, '资格复核工单',
-            `项目"${announcement.title}"第${candidate.ranking}名候选人"${candidate.supplier_name}"需进行资格复核`,
-            'warning', reviewId, 'qualification_review');
+        if (!isReEvaluation) {
+            notifySupervisor(db, '资格复核工单',
+                `项目"${announcement.title}"第${candidate.ranking}名候选人"${candidate.supplier_name}"需进行资格复核`,
+                'warning', reviewId, 'qualification_review');
+        }
     });
 
-    queryRun(db,
-        `UPDATE bidding_announcements SET status = 'evaluated', updated_at = datetime('now','localtime') WHERE id = ?`,
-        [announcementId]
-    );
+    if (announcement.status !== 'awarded') {
+        queryRun(db,
+            `UPDATE bidding_announcements SET status = 'evaluated', updated_at = datetime('now','localtime') WHERE id = ?`,
+            [announcementId]
+        );
+    }
 
-    evaluationResults.forEach(result => {
-        notifySupplier(db, result.supplier_id, '评标结果通知',
-            `项目"${announcement.title}"评标完成，您的综合得分：${result.total_score}分，排名：第${result.ranking}名`,
-            result.is_candidate ? 'success' : 'info',
-            announcementId, 'evaluation');
-    });
+    if (!isReEvaluation) {
+        evaluationResults.forEach(result => {
+            notifySupplier(db, result.supplier_id, '评标结果通知',
+                `项目"${announcement.title}"评标完成，您的综合得分：${result.total_score}分，排名：第${result.ranking}名`,
+                result.is_candidate ? 'success' : 'info',
+                announcementId, 'evaluation');
+        });
 
-    notifyPurchaser(db, announcement.request_id, '评标完成',
-        `项目"${announcement.title}"评标完成，共${evaluationResults.length}家有效投标，已生成中标候选人排序`,
-        'info');
-    notifySupervisor(db, '评标完成',
-        `项目"${announcement.title}"评标完成，前2名已触发资格复核`,
-        'info', announcementId, 'evaluation');
+        notifyPurchaser(db, announcement.request_id, '评标完成',
+            `项目"${announcement.title}"评标完成，共${evaluationResults.length}家有效投标，已生成中标候选人排序`,
+            'info');
+        notifySupervisor(db, '评标完成',
+            `项目"${announcement.title}"评标完成，前2名已触发资格复核`,
+            'info', announcementId, 'evaluation');
+    }
 
     return {
         success: true,
         data: {
             announcement_id: announcementId,
             evaluation_rule: rule,
-            candidates: evaluationResults
+            candidates: evaluationResults,
+            is_re_evaluation: isReEvaluation
         }
     };
 }

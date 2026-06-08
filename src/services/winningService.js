@@ -19,7 +19,14 @@ function approveWinningResult(db, announcementId, approvedBy) {
     const winner = evaluations[0];
     const supplier = queryOne(db, 'SELECT * FROM suppliers WHERE id = ?', [winner.supplier_id]);
 
-    const winAmount = winner.bid_price || announcement.budget;
+    let winAmount = winner.bid_price;
+    if (!winAmount || winAmount <= 0) {
+        const bidDoc = queryOne(db,
+            'SELECT bid_price FROM bid_documents WHERE announcement_id = ? AND supplier_id = ? AND is_valid = 1',
+            [announcementId, winner.supplier_id]
+        );
+        winAmount = (bidDoc && bidDoc.bid_price > 0) ? bidDoc.bid_price : announcement.budget;
+    }
 
     const existingResult = queryOne(db,
         'SELECT * FROM winning_results WHERE announcement_id = ? AND supplier_id = ?',
