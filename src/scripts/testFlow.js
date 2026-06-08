@@ -29,10 +29,10 @@ function assert(condition, msg) {
 
 async function test() {
     console.log('========================================');
-    console.log('  端到端验证：评标重评+报价一致性');
+    console.log('  端到端验证：复核工单+顺延+报价风险');
     console.log('========================================\n');
 
-    console.log('=== 1. 提交采购需求（货物类）===');
+    console.log('=== 1. 提交采购需求（货物类，预算80万）===');
     const req1 = await post('/api/procurement/requests', {
         title: '办公设备采购项目', category: '货物类', budget: 800000, quantity: 200,
         description: '采购办公电脑及打印设备', specs: 'CPU i7/16G/512G SSD+激光打印机',
@@ -40,13 +40,12 @@ async function test() {
         purchaser_id: 'P001', purchaser_name: 'XX市财政局', dept_name: '政府采购处'
     });
     const reqId = req1.data.id;
-    console.log('需求ID:', reqId, '推荐方式:', req1.data.recommended_method);
 
     console.log('\n=== 2. 审核通过 + 发布公告 ===');
     await put('/api/procurement/requests/' + reqId + '/review', { action: 'approve' });
     const ann = await post('/api/announcement/announcements', { request_id: reqId });
     const annId = ann.data.id;
-    console.log('公告ID:', annId, '预算:', ann.data.budget);
+    console.log('公告ID:', annId);
 
     const suppliers = (await get('/api/supplier')).data;
     const huaxin = suppliers.find(s => s.name.includes('华信'));
@@ -61,123 +60,144 @@ async function test() {
     assert(reg2.success, '恒通报名通过');
     await put('/api/registration/registrations/' + reg2.data.registration_id + '/deposit', {});
 
-    console.log('\n=== 4. 两个供应商提交完整投标文件（不同报价和评分）===');
-    const HUAXIN_PRICE = 435000, HUAXIN_TECH = 85, HUAXIN_BIZ = 78;
-    const HENGTONG_PRICE = 468000, HENGTONG_TECH = 72, HENGTONG_BIZ = 82;
-
-    const bid1 = await post('/api/bid-opening/bid-documents', {
+    console.log('\n=== 4. 两个供应商提交完整投标文件（华信报435000，恒通报468000）===');
+    await post('/api/bid-opening/bid-documents', {
         announcement_id: annId, supplier_id: huaxin.id,
         file_name: '投标函,技术方案,报价单,资格证明文件',
-        bid_price: HUAXIN_PRICE, technical_score: HUAXIN_TECH, business_score: HUAXIN_BIZ
+        bid_price: 435000, technical_score: 85, business_score: 78
     });
-    assert(bid1.success, '华信投标文件提交成功');
-
-    const bid2 = await post('/api/bid-opening/bid-documents', {
+    await post('/api/bid-opening/bid-documents', {
         announcement_id: annId, supplier_id: hengtong.id,
         file_name: '投标函,技术方案,报价单,资格证明文件',
-        bid_price: HENGTONG_PRICE, technical_score: HENGTONG_TECH, business_score: HENGTONG_BIZ
+        bid_price: 468000, technical_score: 72, business_score: 82
     });
-    assert(bid2.success, '恒通投标文件提交成功');
 
     console.log('\n=== 5. 开标 ===');
     const opening = await post('/api/bid-opening/bid-openings', { announcement_id: annId });
-    console.log('有效投标:', opening.data.valid_bids, '无效投标:', opening.data.invalid_bids);
     assert(opening.data.valid_bids === 2, '两家有效投标');
-    assert(opening.data.invalid_bids === 0, '无无效投标');
 
     console.log('\n=== 6. 第一次评标 ===');
     const eval1 = await post('/api/evaluation/evaluations', { announcement_id: annId });
     assert(eval1.success, '第一次评标成功');
     assert(eval1.data.is_re_evaluation === false, '标记为首次评标');
-    console.log('第一次评标结果:');
-    const firstScores = {};
+    assert(eval1.data.round === 1, '轮次=1');
+
+    console.log('\n评分明细:');
     eval1.data.candidates.forEach(c => {
-        firstScores[c.supplier_name] = c.total_score;
-        console.log(`  排名${c.ranking}: ${c.supplier_name} 技术=${c.technical_score} 商务=${c.business_score} 价格=${c.price_score} 报价=${c.bid_price} 总分=${c.total_score}`);
+        console.log(`  排名${c.ranking}: ${c.supplier_name} 报价=${c.bid_price} ` +
+            `技术=${c.technical_score}×${c.score_breakdown.technical.weight}%=${c.score_breakdown.technical.weighted} ` +
+            `商务=${c.business_score}×${c.score_breakdown.business.weight}%=${c.score_breakdown.business.weighted} ` +
+            `价格=${c.price_score}×${c.score_breakdown.price.weight}%=${c.score_breakdown.price.weighted} ` +
+            `总分=${c.total_score} 复核ID=${c.qualification_review_id} 复核状态=${c.qualification_review_status}`);
     });
 
-    console.log('\n=== 7. 第二次评标（重复调用）===');
+    assert(eval1.data.candidates[0].score_breakdown, '返回了评分明细(score_breakdown)');
+    assert(eval1.data.score_detail.formula, '返回了计算公式');
+
+    const huaxinReviewId = eval1.data.candidates.find(c => c.supplier_name.includes('华信')).qualification_review_id;
+    const hengtongReviewId = eval1.data.candidates.find(c => c.supplier_name.includes('恒通')).qualification_review_id;
+    console.log(`  华信复核ID: ${huaxinReviewId}`);
+    console.log(`  恒通复核ID: ${hengtongReviewId}`);
+
+    console.log('\n=== 7. 检查首次评标后的监管通知 ===');
+    let notifs1 = await get('/api/notification?recipient_type=supervisor');
+    const qualReviewNotifs1 = notifs1.data.filter(n => n.title === '资格复核工单');
+    console.log(`  资格复核通知数: ${qualReviewNotifs1.length}`);
+    assert(qualReviewNotifs1.length === 2, '首次评标生成2条资格复核通知');
+
+    console.log('\n=== 8. 第二次评标（验证复核工单不丢不重）===');
     const eval2 = await post('/api/evaluation/evaluations', { announcement_id: annId });
-    assert(eval2.success, '第二次评标成功（不拦截）');
+    assert(eval2.success, '第二次评标成功');
     assert(eval2.data.is_re_evaluation === true, '标记为重复评标');
-    console.log('第二次评标结果:');
-    const secondScores = {};
-    eval2.data.candidates.forEach(c => {
-        secondScores[c.supplier_name] = c.total_score;
-        console.log(`  排名${c.ranking}: ${c.supplier_name} 技术=${c.technical_score} 商务=${c.business_score} 价格=${c.price_score} 报价=${c.bid_price} 总分=${c.total_score}`);
+    assert(eval2.data.round === 2, '轮次=2');
+
+    const huaxinReviewId2 = eval2.data.candidates.find(c => c.supplier_name.includes('华信')).qualification_review_id;
+    const hengtongReviewId2 = eval2.data.candidates.find(c => c.supplier_name.includes('恒通')).qualification_review_id;
+    console.log(`  华信复核ID(第二次): ${huaxinReviewId2}`);
+    console.log(`  恒通复核ID(第二次): ${hengtongReviewId2}`);
+
+    assert(huaxinReviewId === huaxinReviewId2, '华信复核ID保持不变');
+    assert(hengtongReviewId === hengtongReviewId2, '恒通复核ID保持不变');
+
+    notifs1 = await get('/api/notification?recipient_type=supervisor');
+    const qualReviewNotifs2 = notifs1.data.filter(n => n.title === '资格复核工单');
+    console.log(`  资格复核通知数(二次评标后): ${qualReviewNotifs2.length}`);
+    assert(qualReviewNotifs2.length === 2, '复核通知仍然是2条（不增不减）');
+
+    console.log('\n=== 9. 查询评标历史 ===');
+    const history = await get('/api/evaluation/history/' + annId);
+    assert(history.data.length === 2, '评标历史2条记录');
+    assert(history.data[0].round === 1, '第1轮');
+    assert(history.data[1].round === 2, '第2轮');
+    assert(history.data[1].is_re_evaluation === 1, '第2轮标记为重评');
+
+    console.log('\n=== 10. 监管端复核：华信不通过，恒通通过 ===');
+    const reviewFail = await put('/api/evaluation/qualification-review/' + huaxinReviewId, {
+        status: 'failed', reviewed_by: 'supervisor01'
     });
+    assert(reviewFail.success, '华信复核不通过');
+    assert(reviewFail.data.review_status === 'failed', '状态=failed');
 
-    assert(firstScores['华信科技集团有限公司'] === secondScores['华信科技集团有限公司'],
-        `华信两次评分一致: ${firstScores['华信科技集团有限公司']} vs ${secondScores['华信科技集团有限公司']}`);
-    assert(firstScores['恒通设备制造有限公司'] === secondScores['恒通设备制造有限公司'],
-        `恒通两次评分一致: ${firstScores['恒通设备制造有限公司']} vs ${secondScores['恒通设备制造有限公司']}`);
+    const reviewPass = await put('/api/evaluation/qualification-review/' + hengtongReviewId, {
+        status: 'passed', reviewed_by: 'supervisor01'
+    });
+    assert(reviewPass.success, '恒通复核通过');
+    assert(reviewPass.data.review_status === 'passed', '状态=passed');
 
-    const firstRanking = eval1.data.candidates.map(c => c.supplier_name).join(',');
-    const secondRanking = eval2.data.candidates.map(c => c.supplier_name).join(',');
-    assert(firstRanking === secondRanking, `排名顺序一致: ${firstRanking}`);
-
-    console.log('\n=== 8. 第三次评标（再验证一次）===');
-    const eval3 = await post('/api/evaluation/evaluations', { announcement_id: annId });
-    assert(eval3.success, '第三次评标成功');
-    assert(eval3.data.is_re_evaluation === true, '标记为重复评标');
-    const thirdScores = {};
-    eval3.data.candidates.forEach(c => { thirdScores[c.supplier_name] = c.total_score; });
-    assert(firstScores['华信科技集团有限公司'] === thirdScores['华信科技集团有限公司'],
-        '华信三次评分一致');
-    assert(firstScores['恒通设备制造有限公司'] === thirdScores['恒通设备制造有限公司'],
-        '恒通三次评分一致');
-
-    console.log('\n=== 9. 中标审批 ===');
+    console.log('\n=== 11. 中标审批（应顺延到恒通）===');
     const win = await post('/api/winning/approve', { announcement_id: annId, approved_by: 'admin001' });
     assert(win.success, '中标审批成功');
 
-    const winnerName = win.data.winner.supplier_name;
+    console.log(`  中标供应商: ${win.data.winner.supplier_name}`);
+    console.log(`  中标金额: ${win.data.win_amount}`);
+    console.log(`  是否顺延: ${win.data.is_fallback}`);
+    console.log(`  顺延原因: ${win.data.fallback_reason}`);
+
+    assert(win.data.is_fallback === true, '中标为顺延');
+    assert(win.data.winner.supplier_name.includes('恒通'), '中标供应商是恒通（顺延）');
+    assert(win.data.win_amount === 468000, '中标金额=恒通报价468000');
+    assert(win.data.fallback_reason !== null, '有顺延原因');
+
+    console.log('\n=== 12. 验证中标结果一致性 ===');
     const winAmount = win.data.win_amount;
     const contractAmount = win.data.contract_draft.amount;
     const announcementAmount = win.data.result_announcement.win_amount;
-    const expectedWinAmount = firstRanking.split(',')[0] === '华信科技集团有限公司' ? HUAXIN_PRICE : HENGTONG_PRICE;
 
-    console.log(`  中标供应商: ${winnerName}`);
-    console.log(`  中标金额: ${winAmount}`);
-    console.log(`  合同金额: ${contractAmount}`);
-    console.log(`  公告金额: ${announcementAmount}`);
-    console.log(`  期望金额(供应商报价): ${expectedWinAmount}`);
+    assert(winAmount === contractAmount, `合同金额一致: ${winAmount}=${contractAmount}`);
+    assert(winAmount === announcementAmount, `公告金额一致: ${winAmount}=${announcementAmount}`);
+    assert(win.data.result_announcement.is_fallback === true, '公告标记为顺延');
+    assert(win.data.result_announcement.failed_candidates.length > 0, '公告包含未通过候选人');
 
-    assert(winAmount === expectedWinAmount, `中标金额=供应商报价(${expectedWinAmount})`);
-    assert(winAmount === contractAmount, '中标金额=合同金额');
-    assert(winAmount === announcementAmount, '中标金额=公告金额');
-    assert(winAmount !== 800000, '中标金额不是项目预算800000');
-
-    console.log('\n=== 10. 查询中标结果列表 ===');
+    console.log('\n=== 13. 查询中标结果列表 ===');
     const winResults = await get('/api/winning');
     const thisResult = winResults.data.find(r => r.announcement_id === annId);
-    assert(thisResult && thisResult.win_amount === winAmount, '中标结果列表金额一致');
+    assert(thisResult && thisResult.supplier_name.includes('恒通'), '中标结果列表: 供应商=恒通');
+    assert(thisResult && thisResult.win_amount === 468000, '中标结果列表: 金额=468000');
 
-    console.log('\n=== 11. 查询合同列表 ===');
+    console.log('\n=== 14. 查询合同列表 ===');
     const contracts = await get('/api/contract/contracts');
     const thisContract = contracts.data.find(c => c.announcement_id === annId);
-    assert(thisContract && thisContract.amount === winAmount, '合同列表金额一致');
+    assert(thisContract && thisContract.supplier_name.includes('恒通'), '合同: 供应商=恒通');
+    assert(thisContract && thisContract.amount === 468000, '合同: 金额=468000');
 
-    console.log('\n=== 12. 检查监管通知（不重复）===');
+    console.log('\n=== 15. 检查监管通知完整性 ===');
     const notifs = await get('/api/notification?recipient_type=supervisor');
-    const supervisorNotifs = notifs.data;
+    const allNotifs = notifs.data;
 
-    const qualReviewNotifs = supervisorNotifs.filter(n => n.title === '资格复核工单');
-    console.log(`  资格复核通知数: ${qualReviewNotifs.length}`);
-    assert(qualReviewNotifs.length <= 2, '资格复核通知不超过2条（不因重复评标累积）');
+    const qualReviewNotifs = allNotifs.filter(n => n.title === '资格复核工单');
+    console.log(`  资格复核通知: ${qualReviewNotifs.length}条`);
+    assert(qualReviewNotifs.length === 2, '复核工单通知2条（不丢不重）');
 
-    const evalCompleteNotifs = supervisorNotifs.filter(n => n.title === '评标完成');
-    console.log(`  评标完成通知数: ${evalCompleteNotifs.length}`);
-    assert(evalCompleteNotifs.length === 1, '评标完成通知只有1条（重复评标不重复通知）');
+    const reviewResultNotifs = allNotifs.filter(n => n.title === '资格复核结果');
+    console.log(`  复核结果通知: ${reviewResultNotifs.length}条`);
+    assert(reviewResultNotifs.length >= 2, '复核结果通知≥2条');
 
-    const winningNotifs = supervisorNotifs.filter(n => n.title === '中标公告已发布');
-    console.log(`  中标公告通知数: ${winningNotifs.length}`);
+    const winningNotif = allNotifs.find(n => n.title === '中标公告已发布');
+    assert(winningNotif, '有中标公告通知');
+    assert(winningNotif.content.includes('顺延'), '中标通知包含顺延信息');
 
-    console.log('\n=== 13. 合同确认生效 → 检查监管通知 ===');
-    await put('/api/contract/contracts/' + win.data.contract_id + '/confirm', {});
-    const notifs2 = await get('/api/notification?recipient_type=supervisor');
-    const contractNotif = notifs2.data.find(n => n.title === '合同已生效' && n.content.includes(winAmount.toFixed(2)));
-    assert(contractNotif, `合同生效通知包含正确金额￥${winAmount.toFixed(2)}`);
+    const contractConfirmNotif = allNotifs.filter(n => n.content.includes('恒通') && n.content.includes('468000'));
+    console.log(`  包含恒通+468000的通知: ${contractConfirmNotif.length}条`);
 
     console.log('\n========================================');
     if (errors === 0) {

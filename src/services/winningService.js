@@ -16,7 +16,22 @@ function approveWinningResult(db, announcementId, approvedBy) {
         return { success: false, message: '无中标候选人' };
     }
 
-    const winner = evaluations[0];
+    const passedEvaluations = evaluations.filter(e => e.qualification_review_status === 'passed');
+    const pendingEvaluations = evaluations.filter(e => e.qualification_review_status === 'pending' || !e.qualification_review_status);
+    const failedEvaluations = evaluations.filter(e => e.qualification_review_status === 'failed');
+
+    if (passedEvaluations.length === 0) {
+        return {
+            success: false,
+            message: `所有候选人均未通过资格复核（${failedEvaluations.length}人不通过，${pendingEvaluations.length}人待复核），无法审批中标`,
+            data: {
+                failed_candidates: failedEvaluations.map(e => ({ supplier_name: e.supplier_name, ranking: e.ranking, review_status: 'failed' })),
+                pending_candidates: pendingEvaluations.map(e => ({ supplier_name: e.supplier_name, ranking: e.ranking, review_status: 'pending' }))
+            }
+        };
+    }
+
+    const winner = passedEvaluations[0];
     const supplier = queryOne(db, 'SELECT * FROM suppliers WHERE id = ?', [winner.supplier_id]);
 
     let winAmount = winner.bid_price;
@@ -28,17 +43,19 @@ function approveWinningResult(db, announcementId, approvedBy) {
         winAmount = (bidDoc && bidDoc.bid_price > 0) ? bidDoc.bid_price : announcement.budget;
     }
 
+    const isFallback = winner.ranking > 1;
+
     const existingResult = queryOne(db,
-        'SELECT * FROM winning_results WHERE announcement_id = ? AND supplier_id = ?',
-        [announcementId, winner.supplier_id]
+        'SELECT * FROM winning_results WHERE announcement_id = ?',
+        [announcementId]
     );
 
     let resultId;
     if (existingResult) {
         resultId = existingResult.id;
         queryRun(db,
-            `UPDATE winning_results SET status = 'approved', win_amount = ?, approved_by = ?, approved_at = datetime('now','localtime') WHERE id = ?`,
-            [winAmount, approvedBy, resultId]
+            `UPDATE winning_results SET supplier_id = ?, supplier_name = ?, total_score = ?, win_amount = ?, status = 'approved', approved_by = ?, approved_at = datetime('now','localtime') WHERE id = ?`,
+            [winner.supplier_id, supplier ? supplier.name : '', winner.total_score, winAmount, approvedBy, resultId]
         );
     } else {
         resultId = generateId('WIN');
@@ -50,26 +67,39 @@ function approveWinningResult(db, announcementId, approvedBy) {
         );
     }
 
-    const resultAnnouncementContent = generateResultAnnouncement(announcement, winner, supplier, winAmount);
+    const resultAnnouncementContent = generateResultAnnouncement(announcement, winner, supplier, winAmount, isFallback, failedEvaluations);
     const resultAnnId = generateId('RAN');
     queryRun(db, 'UPDATE winning_results SET result_announcement_id = ? WHERE id = ?', [resultAnnId, resultId]);
 
-    const contractId = generateId('CON');
-    const contractDraft = generateContractDraft(announcement, winner, supplier, resultId, winAmount);
-    queryRun(db,
-        `INSERT INTO contracts
-         (id, winning_result_id, announcement_id, purchaser_id, purchaser_name, supplier_id, supplier_name,
-          title, amount, delivery_date, status, breach_clause, penalty_rate)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)`,
-        [contractId, resultId, announcementId, announcement.purchaser_id,
-         announcement.purchaser_id, winner.supplier_id,
-         supplier ? supplier.name : '',
-         announcement.title + '采购合同',
-         winAmount,
-         announcement.bid_opening_date,
-         contractDraft.breach_clause,
-         contractDraft.penalty_rate]
+    const existingContract = queryOne(db,
+        'SELECT * FROM contracts WHERE announcement_id = ?',
+        [announcementId]
     );
+    let contractId;
+    if (existingContract) {
+        contractId = existingContract.id;
+        queryRun(db,
+            `UPDATE contracts SET supplier_id = ?, supplier_name = ?, amount = ?, status = 'draft', updated_at = datetime('now','localtime') WHERE id = ?`,
+            [winner.supplier_id, supplier ? supplier.name : '', winAmount, contractId]
+        );
+    } else {
+        contractId = generateId('CON');
+        const contractDraft = generateContractDraft(announcement, winner, supplier, resultId, winAmount);
+        queryRun(db,
+            `INSERT INTO contracts
+             (id, winning_result_id, announcement_id, purchaser_id, purchaser_name, supplier_id, supplier_name,
+              title, amount, delivery_date, status, breach_clause, penalty_rate)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)`,
+            [contractId, resultId, announcementId, announcement.purchaser_id,
+             announcement.purchaser_id, winner.supplier_id,
+             supplier ? supplier.name : '',
+             announcement.title + '采购合同',
+             winAmount,
+             announcement.bid_opening_date,
+             contractDraft.breach_clause,
+             contractDraft.penalty_rate]
+        );
+    }
 
     queryRun(db, 'UPDATE winning_results SET contract_id = ? WHERE id = ?', [contractId, resultId]);
 
@@ -85,10 +115,10 @@ function approveWinningResult(db, announcementId, approvedBy) {
         `项目"${announcement.title}"中标结果已审批，中标供应商：${supplier ? supplier.name : ''}，中标金额：￥${winAmount.toFixed(2)}，合同草稿已生成`,
         'success');
     notifySupervisor(db, '中标公告已发布',
-        `项目"${announcement.title}"中标结果已审批并发布公告，中标金额：￥${winAmount.toFixed(2)}`,
+        `项目"${announcement.title}"中标结果已审批并发布公告，中标金额：￥${winAmount.toFixed(2)}${isFallback ? `（原第1名复核不通过，顺延至第${winner.ranking}名）` : ''}`,
         'info', resultAnnId, 'result_announcement');
 
-    const otherCandidates = evaluations.slice(1);
+    const otherCandidates = evaluations.filter(e => e.supplier_id !== winner.supplier_id);
     otherCandidates.forEach(candidate => {
         notifySupplier(db, candidate.supplier_id, '评标结果通知',
             `项目"${announcement.title}"评标结果已出，您未中标，感谢参与`,
@@ -104,17 +134,25 @@ function approveWinningResult(db, announcementId, approvedBy) {
                 supplier_id: winner.supplier_id,
                 supplier_name: supplier ? supplier.name : '',
                 total_score: winner.total_score,
-                ranking: winner.ranking
+                ranking: winner.ranking,
+                qualification_review_status: winner.qualification_review_status
             },
+            is_fallback: isFallback,
+            fallback_reason: isFallback ? `原第1名候选人资格复核未通过，顺延至第${winner.ranking}名` : null,
+            failed_candidates: failedEvaluations.map(e => ({
+                supplier_name: e.supplier_name,
+                ranking: e.ranking,
+                review_status: 'failed'
+            })),
             result_announcement: resultAnnouncementContent,
             contract_id: contractId,
-            contract_draft: contractDraft
+            contract_draft: generateContractDraft(announcement, winner, supplier, resultId, winAmount)
         }
     };
 }
 
-function generateResultAnnouncement(announcement, winner, supplier, winAmount) {
-    return {
+function generateResultAnnouncement(announcement, winner, supplier, winAmount, isFallback, failedEvaluations) {
+    const result = {
         title: `中标结果公告 - ${announcement.title}`,
         announcement_no: announcement.announcement_no,
         project_name: announcement.title,
@@ -122,8 +160,16 @@ function generateResultAnnouncement(announcement, winner, supplier, winAmount) {
         winner_name: supplier ? supplier.name : '',
         winner_score: winner.total_score,
         win_amount: winAmount,
+        is_fallback: isFallback || false,
+        fallback_reason: isFallback ? `原第1名候选人资格复核未通过，顺延至第${winner.ranking}名` : null,
+        failed_candidates: (failedEvaluations || []).map(e => ({
+            supplier_name: e.supplier_name,
+            ranking: e.ranking,
+            reason: '资格复核未通过'
+        })),
         published_at: new Date().toISOString()
     };
+    return result;
 }
 
 function generateContractDraft(announcement, winner, supplier, resultId, winAmount) {

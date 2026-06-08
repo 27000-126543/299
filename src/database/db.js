@@ -271,6 +271,56 @@ function createTables() {
     `);
 
     db.run(`
+        CREATE TABLE IF NOT EXISTS objections (
+            id TEXT PRIMARY KEY,
+            announcement_id TEXT NOT NULL,
+            supplier_id TEXT NOT NULL,
+            supplier_name TEXT,
+            objection_type TEXT NOT NULL,
+            objection_content TEXT NOT NULL,
+            status TEXT DEFAULT 'pending',
+            handler_id TEXT,
+            handler_name TEXT,
+            handling_opinion TEXT,
+            conclusion TEXT,
+            handled_at TEXT,
+            created_at TEXT DEFAULT (datetime('now','localtime')),
+            FOREIGN KEY (announcement_id) REFERENCES bidding_announcements(id),
+            FOREIGN KEY (supplier_id) REFERENCES suppliers(id)
+        )
+    `);
+
+    db.run(`
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id TEXT PRIMARY KEY,
+            announcement_id TEXT NOT NULL,
+            action_type TEXT NOT NULL,
+            operator_id TEXT,
+            operator_name TEXT,
+            before_status TEXT,
+            after_status TEXT,
+            detail TEXT,
+            supplier_id TEXT,
+            supplier_name TEXT,
+            created_at TEXT DEFAULT (datetime('now','localtime')),
+            FOREIGN KEY (announcement_id) REFERENCES bidding_announcements(id)
+        )
+    `);
+
+    db.run(`
+        CREATE TABLE IF NOT EXISTS evaluation_history (
+            id TEXT PRIMARY KEY,
+            announcement_id TEXT NOT NULL,
+            round INTEGER DEFAULT 1,
+            is_re_evaluation INTEGER DEFAULT 0,
+            score_detail TEXT,
+            ranking_change TEXT,
+            evaluated_at TEXT DEFAULT (datetime('now','localtime')),
+            FOREIGN KEY (announcement_id) REFERENCES bidding_announcements(id)
+        )
+    `);
+
+    db.run(`
         CREATE TABLE IF NOT EXISTS bid_openings (
             id TEXT PRIMARY KEY,
             announcement_id TEXT NOT NULL,
@@ -324,6 +374,9 @@ function migrateDatabase() {
         stmt.free();
         if (!colNames.includes('bid_price')) {
             db.run('ALTER TABLE evaluations ADD COLUMN bid_price DECIMAL(15,2) DEFAULT 0');
+        }
+        if (!colNames.includes('price_alert')) {
+            db.run('ALTER TABLE evaluations ADD COLUMN price_alert TEXT');
         }
 
         saveDatabase();

@@ -15,6 +15,7 @@ const contractRoutes = require('./routes/contract');
 const reportRoutes = require('./routes/report');
 const notificationRoutes = require('./routes/notification');
 const supplierRoutes = require('./routes/supplier');
+const objectionRoutes = require('./routes/objection');
 
 const { generateDailyReport } = require('./services/reportService');
 const { checkContractDelays } = require('./services/contractService');
@@ -38,6 +39,7 @@ app.use('/api/contract', contractRoutes);
 app.use('/api/report', reportRoutes);
 app.use('/api/notification', notificationRoutes);
 app.use('/api/supplier', supplierRoutes);
+app.use('/api/objection', objectionRoutes);
 
 app.get('/api/health', (req, res) => {
     res.json({ status: 'ok', service: '智慧政府采购与招投标管理系统', version: '1.0.0' });
